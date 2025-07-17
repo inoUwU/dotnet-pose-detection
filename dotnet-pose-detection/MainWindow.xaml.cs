@@ -182,9 +182,15 @@ public partial class MainWindow : Window
             }
         }
 
+
         if (!Directory.Exists(outputImageLocation))
         {
             Directory.CreateDirectory(outputImageLocation);
+        }
+
+        if (File.Exists(Path.Combine(outputImageLocation, imageName)))
+        {
+            File.Delete(Path.Combine(outputImageLocation, imageName));
         }
 
         image.Save(Path.Combine(outputImageLocation, imageName));
