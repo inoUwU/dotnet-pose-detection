@@ -50,7 +50,22 @@ public partial class MainWindow : Window
             this._ImagePath = dlg.FileName;
         }
 
-        this.OriginalImage.Source = this._ImagePath == null ? null : new BitmapImage(new Uri(this._ImagePath));
+        // ファイルロックを回避するためのBitmapImage設定
+        if (this._ImagePath != null)
+        {
+            var bitmap = new BitmapImage();
+            bitmap.BeginInit();
+            bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            bitmap.UriSource = new Uri(this._ImagePath);
+            bitmap.EndInit();
+            bitmap.Freeze();
+
+            this.OriginalImage.Source = bitmap;
+        }
+        else
+        {
+            this.OriginalImage.Source = null;
+        }
     }
 
     private void DetectByYoLoBtn_Click(object sender, RoutedEventArgs e)
@@ -108,6 +123,7 @@ public partial class MainWindow : Window
             var detectedObjects = boundingBoxes.First();
             string outputPath = Path.Combine(Path.GetDirectoryName(_ImagePath)!, "output");
 
+            this.DetectedImage.Source = null; // Clear previous image
             DrawBoundingBox(selectedImageFolder, outputPath, selectedImageFileName, detectedObjects);
             LogDetectedObjects(selectedImageFileName, detectedObjects);
 
@@ -115,7 +131,15 @@ public partial class MainWindow : Window
             string outputImagePath = Path.Combine(outputPath, selectedImageFileName);
             if (File.Exists(outputImagePath))
             {
-                this.DetectedImage.Source = new BitmapImage(new Uri(outputImagePath));
+                // BitmapImageのキャッシュを無効化して、ファイルロックを回避
+                var bitmap = new BitmapImage();
+                bitmap.BeginInit();
+                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.UriSource = new Uri(outputImagePath);
+                bitmap.EndInit();
+                bitmap.Freeze(); // UIスレッド外でも使用可能にする
+
+                this.DetectedImage.Source = bitmap;
             }
 
             MessageBox.Show($"物体検出が完了しました。{detectedObjects.Count}個のオブジェクトが検出されました。",
@@ -135,65 +159,102 @@ public partial class MainWindow : Window
 
     private static void DrawBoundingBox(string inputImageLocation, string outputImageLocation, string imageName, IList<YoloBoundingBox> filteredBoundingBoxes)
     {
-        var image = System.Drawing.Image.FromFile(Path.Combine(inputImageLocation, imageName));
+        string inputPath = Path.Combine(inputImageLocation, imageName);
+        string outputPath = Path.Combine(outputImageLocation, imageName);
 
-        var originalImageHeight = image.Height;
-        var originalImageWidth = image.Width;
-
-        foreach (var box in filteredBoundingBoxes)
-        {
-            // Get Bounding Box Dimensions
-            var x = (uint)Math.Max(box.Dimensions.X, 0);
-            var y = (uint)Math.Max(box.Dimensions.Y, 0);
-            var width = (uint)Math.Min(originalImageWidth - x, box.Dimensions.Width);
-            var height = (uint)Math.Min(originalImageHeight - y, box.Dimensions.Height);
-
-            // Resize To Image
-            x = (uint)originalImageWidth * x / OnnxModelScorer.ImageNetSettings.imageWidth;
-            y = (uint)originalImageHeight * y / OnnxModelScorer.ImageNetSettings.imageHeight;
-            width = (uint)originalImageWidth * width / OnnxModelScorer.ImageNetSettings.imageWidth;
-            height = (uint)originalImageHeight * height / OnnxModelScorer.ImageNetSettings.imageHeight;
-
-            // Bounding Box Text
-            string text = $"{box.Label} ({(box.Confidence * 100).ToString("0")}%)";
-
-            using (Graphics thumbnailGraphic = Graphics.FromImage(image))
-            {
-                thumbnailGraphic.CompositingQuality = CompositingQuality.HighQuality;
-                thumbnailGraphic.SmoothingMode = SmoothingMode.HighQuality;
-                thumbnailGraphic.InterpolationMode = InterpolationMode.HighQualityBicubic;
-
-                // Define Text Options
-                System.Drawing.Font drawFont = new System.Drawing.Font("Arial", 12, System.Drawing.FontStyle.Bold);
-                SizeF size = thumbnailGraphic.MeasureString(text, drawFont);
-                SolidBrush fontBrush = new SolidBrush(System.Drawing.Color.Black);
-                System.Drawing.Point atPoint = new System.Drawing.Point((int)x, (int)y - (int)size.Height - 1);
-
-                // Define BoundingBox options
-                System.Drawing.Pen pen = new System.Drawing.Pen(box.BoxColor, 3.2f);
-                SolidBrush colorBrush = new SolidBrush(box.BoxColor);
-
-                // Draw text on image 
-                thumbnailGraphic.FillRectangle(colorBrush, (int)x, (int)y - (int)size.Height - 1, (int)size.Width, (int)size.Height);
-                thumbnailGraphic.DrawString(text, drawFont, fontBrush, atPoint);
-
-                // Draw bounding box on image
-                thumbnailGraphic.DrawRectangle(pen, x, y, width, height);
-            }
-        }
-
-
+        // Create output directory if it doesn't exist
         if (!Directory.Exists(outputImageLocation))
         {
             Directory.CreateDirectory(outputImageLocation);
         }
 
-        if (File.Exists(Path.Combine(outputImageLocation, imageName)))
+        // 既存の出力ファイルが存在する場合は削除（ファイルロック対策）
+        if (File.Exists(outputPath))
         {
-            File.Delete(Path.Combine(outputImageLocation, imageName));
+            try
+            {
+                File.Delete(outputPath);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"ファイル削除エラー: {ex.Message}");
+                // ファイルがロックされている場合は、異なる名前で保存
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string fileName = Path.GetFileNameWithoutExtension(imageName);
+                string extension = Path.GetExtension(imageName);
+                outputPath = Path.Combine(outputImageLocation, $"{fileName}_{timestamp}{extension}");
+            }
         }
 
-        image.Save(Path.Combine(outputImageLocation, imageName));
+        // 画像を読み込み、コピーを作成してから編集
+        using (var originalImage = System.Drawing.Image.FromFile(inputPath))
+        {
+            // 元画像のコピーを作成
+            using (var image = new Bitmap(originalImage.Width, originalImage.Height))
+            {
+                using (var graphics = Graphics.FromImage(image))
+                {
+                    // 元画像をコピー
+                    graphics.DrawImage(originalImage, 0, 0, originalImage.Width, originalImage.Height);
+
+                    var originalImageHeight = image.Height;
+                    var originalImageWidth = image.Width;
+
+                    foreach (var box in filteredBoundingBoxes)
+                    {
+                        // Get Bounding Box Dimensions
+                        var x = (uint)Math.Max(box.Dimensions.X, 0);
+                        var y = (uint)Math.Max(box.Dimensions.Y, 0);
+                        var width = (uint)Math.Min(originalImageWidth - x, box.Dimensions.Width);
+                        var height = (uint)Math.Min(originalImageHeight - y, box.Dimensions.Height);
+
+                        // Resize To Image
+                        x = (uint)originalImageWidth * x / OnnxModelScorer.ImageNetSettings.imageWidth;
+                        y = (uint)originalImageHeight * y / OnnxModelScorer.ImageNetSettings.imageHeight;
+                        width = (uint)originalImageWidth * width / OnnxModelScorer.ImageNetSettings.imageWidth;
+                        height = (uint)originalImageHeight * height / OnnxModelScorer.ImageNetSettings.imageHeight;
+
+                        // Bounding Box Text
+                        string text = $"{box.Label} ({(box.Confidence * 100).ToString("0")}%)";
+
+                        graphics.CompositingQuality = CompositingQuality.HighQuality;
+                        graphics.SmoothingMode = SmoothingMode.HighQuality;
+                        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+
+                        // Define Text Options
+                        using (var drawFont = new System.Drawing.Font("Arial", 12, System.Drawing.FontStyle.Bold))
+                        {
+                            SizeF size = graphics.MeasureString(text, drawFont);
+                            using (var fontBrush = new SolidBrush(System.Drawing.Color.Black))
+                            using (var colorBrush = new SolidBrush(box.BoxColor))
+                            using (var pen = new System.Drawing.Pen(box.BoxColor, 3.2f))
+                            {
+                                System.Drawing.Point atPoint = new System.Drawing.Point((int)x, (int)y - (int)size.Height - 1);
+
+                                // Draw text on image 
+                                graphics.FillRectangle(colorBrush, (int)x, (int)y - (int)size.Height - 1, (int)size.Width, (int)size.Height);
+                                graphics.DrawString(text, drawFont, fontBrush, atPoint);
+
+                                // Draw bounding box on image
+                                graphics.DrawRectangle(pen, x, y, width, height);
+                            }
+                        }
+                    }
+                }
+
+                // 画像を保存
+                try
+                {
+                    image.Save(outputPath);
+                    Console.WriteLine($"画像を保存しました: {outputPath}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"画像保存エラー: {ex.Message}");
+                    throw;
+                }
+            }
+        }
     }
 
     private static void LogDetectedObjects(string imageName, IList<YoloBoundingBox> boundingBoxes)
